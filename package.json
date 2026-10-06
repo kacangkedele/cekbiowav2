@@ -1,0 +1,23 @@
+{
+    "name": "wa-sender-bot",
+    "version": "2.0.0",
+    "description": "WhatsApp Sender API for Telegram Bot",
+    "main": "sender.js",
+    "scripts": {
+        "start": "node sender.js",
+        "dev": "nodemon sender.js",
+        "pm2": "pm2 start sender.js --name wa-sender",
+        "logs": "pm2 logs wa-sender"
+    },
+    "dependencies": {
+        "@whiskeysockets/baileys": "^6.6.0",
+        "express": "^4.18.2",
+        "pino": "^8.17.2",
+        "pino-pretty": "^10.3.0",
+        "cors": "^2.8.5",
+        "express-rate-limit": "^7.1.5"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.2"
+    }
+}
