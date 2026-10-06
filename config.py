@@ -27,7 +27,7 @@ CHANNEL_URL = "https://t.me/AnggaOfficialChannel"
 
 # === QRIS PEMBAYARAN ===
 # Upload gambar QRIS ke imgur/ibb, copy direct link
-QRIS_IMAGE_URL = "https://i.ibb.co/abc12345/qris-angga.jpg"
+QRIS_IMAGE_URL = "qrisaja.png"
 
 # === API SERVER (Node.js sender.js) ===
 # Default: http://localhost:3000 (port dari sender/config.json)
