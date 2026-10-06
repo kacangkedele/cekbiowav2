@@ -255,29 +255,6 @@ API_BASE_URL = "http://localhost:3000"
 
 ---
 
-## 📁 Struktur Project
-
-```
-cekbio-wa-bot/
-├── bot/
-│   ├── bot.py              # Main bot Telegram
-│   ├── config.py           # Konfigurasi bot
-│   ├── cekbio.db           # SQLite database (auto-generated)
-│   ├── requirements.txt
-│   └── bot.log             # Log (auto-generated)
-│
-├── sender/
-│   ├── sender.js           # Main WhatsApp sender API
-│   ├── config.json         # Konfigurasi sender
-│   ├── package.json
-│   ├── auth_info_baileys/  # WA session (auto-generated)
-│   └── logs/               # Log harian
-│
-├── README.md
-└── LICENSE
-```
-
----
 
 ## 📊 Screenshot
 
@@ -370,25 +347,3 @@ Distributed under the MIT License. Lihat [`LICENSE`](LICENSE) untuk detail.
 ````
 
 ---
-
-## 🎯 Fitur README
-
-| Komponen | Status |
-|----------|--------|
-| 📖 Deskripsi lengkap bot | ✅ |
-| 📷 Logo Instagram (klikable badge) | ✅ |
-| 📺 Logo YouTube (klikable badge) | ✅ |
-| 📱 Logo Telegram | ✅ |
-| 🏷️ Tech stack badges | ✅ |
-| 📦 List fitur lengkap | ✅ |
-| 🏗️ Diagram arsitektur | ✅ |
-| 📋 Daftar command | ✅ |
-| 💎 Tabel tier premium | ✅ |
-| 📡 API documentation | ✅ |
-| 🚀 Installation guide | ✅ |
-| ⚙️ Config examples | ✅ |
-| 📁 Project structure | ✅ |
-| 🔧 Troubleshooting table | ✅ |
-| 🤝 Contributing guide | ✅ |
-| ⚠️ Disclaimer | ✅ |
-| 👨‍💻 Author section | ✅ |
