@@ -1,1 +1,20 @@
+# Secrets
+bot/config.py
+sender/config.json
 
+# Database & logs
+*.db
+*.log
+bot.log
+logs/
+backups/
+
+# Node
+node_modules/
+auth_info_baileys/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
