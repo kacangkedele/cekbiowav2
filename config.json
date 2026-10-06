@@ -1,0 +1,6 @@
+{
+    "WA_NUMBER": "6281234567890",
+    "PORT": 3000,
+    "ADMIN_KEY": "your-secret-admin-key-123",
+    "BOT_TOKEN": "YOUR_TELEGRAM_BOT_TOKEN"
+}
