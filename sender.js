@@ -1,43 +1,61 @@
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    fetchLatestBaileysVersion, 
-    DisconnectReason,
-    makeInMemoryStore
+// ==========================================
+// SENDER.JS - Bot Cek Bio WA By Angga Official
+// Versi Stabil (Anti-Error, Minimal Dependency)
+// Butuh: @whiskeysockets/baileys + express
+// ==========================================
+
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    DisconnectReason
 } = require('@whiskeysockets/baileys');
 const express = require('express');
-const P = require('pino');
 const fs = require('fs');
 const path = require('path');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
 const config = require('./config.json');
 
-// ============ LOGGING SETUP ============
+// ============ LOGGER (Pakai console biasa, anti-error) ============
+function log(...args) {
+    const time = new Date().toISOString().split('T')[1].split('.')[0];
+    console.log(`[${time}]`, ...args);
+}
+
+function logError(...args) {
+    const time = new Date().toISOString().split('T')[1].split('.')[0];
+    console.error(`❌ [${time}]`, ...args);
+}
+
+function logWarn(...args) {
+    const time = new Date().toISOString().split('T')[1].split('.')[0];
+    console.warn(`⚠️ [${time}]`, ...args);
+}
+
+function logSuccess(...args) {
+    const time = new Date().toISOString().split('T')[1].split('.')[0];
+    console.log(`✅ [${time}]`, ...args);
+}
+
+// ============ LOG TO FILE ============
 const LOG_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
 
-const logger = P({ 
-    level: 'info',
-    transport: {
-        target: 'pino-pretty',
-        options: {
-            colorize: true,
-            translateTime: 'yyyy-mm-dd HH:MM:ss',
-            destination: path.join(LOG_DIR, `sender_${new Date().toISOString().split('T')[0]}.log`),
-            mkdir: true
-        }
-    }
-});
+function logToFile(msg) {
+    try {
+        const date = new Date().toISOString().split('T')[0];
+        const file = path.join(LOG_DIR, `sender_${date}.log`);
+        fs.appendFileSync(file, `[${new Date().toISOString()}] ${msg}\n`);
+    } catch (e) {}
+}
 
 // ============ GLOBAL STATE ============
 let sock = null;
-let connectionState = 'disconnected'; // disconnected | connecting | connected
+let connectionState = 'disconnected';
 let lastConnectionTime = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 
-// ============ GLOBAL METRICS ============
+// ============ METRICS ============
 const metrics = {
     totalRequests: 0,
     totalSingleChecks: 0,
@@ -50,13 +68,12 @@ const metrics = {
     lastErrorTime: null
 };
 
-// ============ CACHE SYSTEM ============
+// ============ CACHE SYSTEM (TTL) ============
 class TTLCache {
-    constructor(ttlMs = 5 * 60 * 1000) {
+    constructor(ttlMs) {
         this.cache = new Map();
-        this.ttl = ttlMs;
+        this.ttl = ttlMs || (5 * 60 * 1000);
     }
-    
     get(key) {
         const item = this.cache.get(key);
         if (!item) return null;
@@ -66,40 +83,55 @@ class TTLCache {
         }
         return item.value;
     }
-    
     set(key, value) {
         this.cache.set(key, {
-            value,
+            value: value,
             expiry: Date.now() + this.ttl
         });
     }
-    
     clear() {
         this.cache.clear();
     }
-    
     size() {
         return this.cache.size;
     }
 }
 
 const bioCache = new TTLCache(5 * 60 * 1000);
-const cooldownCache = new TTLCache(10 * 60 * 1000); // 10 menit untuk cooldown
+const cooldownCache = new TTLCache(10 * 60 * 1000);
 
-// ============ RATE LIMITER ============
-const apiLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 30,
-    message: { status: false, error: 'Too many requests, try again later.' }
-});
+// ============ RATE LIMIT MANUAL ============
+const rateLimitMap = new Map();
 
-const massLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 5,
-    message: { status: false, error: 'Too many mass check requests.' }
-});
+function manualRateLimit(max, windowMs) {
+    max = max || 30;
+    windowMs = windowMs || 60000;
+    return function (req, res, next) {
+        const ip = req.ip || req.connection.remoteAddress || 'unknown';
+        const now = Date.now();
+        if (!rateLimitMap.has(ip)) {
+            rateLimitMap.set(ip, { count: 0, reset: now + windowMs });
+        }
+        const data = rateLimitMap.get(ip);
+        if (now > data.reset) {
+            data.count = 0;
+            data.reset = now + windowMs;
+        }
+        data.count++;
+        if (data.count > max) {
+            return res.status(429).json({
+                status: false,
+                error: 'Too many requests. Try again later.'
+            });
+        }
+        next();
+    };
+}
 
-// ============ HELPER: VALIDASI NOMOR ============
+const apiLimiter = manualRateLimit(30, 60000);
+const massLimiter = manualRateLimit(5, 60000);
+
+// ============ HELPER: NOMOR ============
 function sanitizeNumber(nomor) {
     if (!nomor || typeof nomor !== 'string') return null;
     const cleaned = nomor.replace(/\D/g, '');
@@ -114,10 +146,16 @@ function toJid(nomor) {
 }
 
 // ============ HELPER: DELAY ============
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+function delay(ms) {
+    return new Promise(function (resolve) {
+        setTimeout(resolve, ms);
+    });
+}
 
-// ============ HELPER: RETRY LOGIC ============
-async function withRetry(fn, maxRetries = 2, delayMs = 1000) {
+// ============ HELPER: RETRY ============
+async function withRetry(fn, maxRetries, delayMs) {
+    maxRetries = maxRetries || 2;
+    delayMs = delayMs || 1000;
     let lastError;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -132,96 +170,162 @@ async function withRetry(fn, maxRetries = 2, delayMs = 1000) {
     throw lastError;
 }
 
-// ============ STORE (untuk message handling) ============
-const store = makeInMemoryStore({ logger: P().child({ level: 'silent' }) });
+// ============ LOGGER BAILEYS (Safe) ============
+function createBaileysLogger() {
+    const noop = function () {};
+    return {
+        level: 'warn',
+        info: noop,
+        debug: noop,
+        trace: noop,
+        warn: function () {
+            const args = Array.from(arguments);
+            console.warn('[Baileys]', ...args);
+        },
+        error: function () {
+            const args = Array.from(arguments);
+            console.error('[Baileys ERROR]', ...args);
+        },
+        fatal: function () {
+            const args = Array.from(arguments);
+            console.error('[Baileys FATAL]', ...args);
+        },
+        child: function () {
+            return createBaileysLogger();
+        }
+    };
+}
 
 // ============ WHATSAPP CONNECTION ============
 async function startWhatsApp() {
     if (connectionState === 'connecting' || connectionState === 'connected') {
-        logger.warn('⚠️  WhatsApp sudah terhubung atau sedang menghubungkan.');
+        logWarn('WhatsApp sudah terhubung atau sedang menghubungkan.');
         return;
     }
-    
-    connectionState = 'connecting';
-    
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    logger.info(`🟢 Menggunakan Baileys versi: ${version} | Terbaru: ${isLatest}`);
-    
-    sock = makeWASocket({
-        version,
-        auth: state,
-        logger: P({ level: 'warn' }),
-        printQRInTerminal: false,
-        browser: ['Bot-Angga', 'Chrome', '1.0.0'],
-        defaultQueryTimeoutMs: 30000,
-        getMessage: async (key) => {
-            return store.loadMessage(key.remoteJid, key.id) || { conversation: '' };
-        }
-    });
 
-    store.bind(sock.ev);
-    
-    sock.ev.on('creds.update', saveCreds);
-    
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            logger.info('📱 QR Code diterima. Scan dengan WhatsApp.');
-        }
-        
-        if (connection === 'open') {
-            connectionState = 'connected';
-            lastConnectionTime = new Date();
-            reconnectAttempts = 0;
-            logger.info('✅ WhatsApp Sender Berhasil Terhubung!');
-            logger.info(`👤 Logged in as: ${sock.user?.id || 'unknown'}`);
-        } else if (connection === 'close') {
-            connectionState = 'disconnected';
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            logger.error(`❌ Koneksi WA terputus. Status Code: ${statusCode || 'Tidak diketahui'}`);
-            
-            if (statusCode !== 410 && statusCode !== 401) {
-                reconnectAttempts++;
-                if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-                    logger.error(`🚫 Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) tercapai. Manual restart diperlukan.`);
-                    return;
+    connectionState = 'connecting';
+    log('Menghubungkan ke WhatsApp...');
+
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+        const { version, isLatest } = await fetchLatestBaileysVersion();
+        log('Baileys versi:', version, '| Terbaru:', isLatest);
+
+        sock = makeWASocket({
+            version: version,
+            auth: state,
+            logger: createBaileysLogger(),
+            printQRInTerminal: false,
+            browser: ['Bot-Angga', 'Chrome', '1.0.0'],
+            defaultQueryTimeoutMs: 30000,
+            connectTimeoutMs: 20000,
+            keepAliveIntervalMs: 30000
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('connection.update', function (update) {
+            const connection = update.connection;
+            const lastDisconnect = update.lastDisconnect;
+            const qr = update.qr;
+
+            if (qr) {
+                log('QR Code tersedia. Gunakan pairing code untuk login.');
+            }
+
+            if (connection === 'open') {
+                connectionState = 'connected';
+                lastConnectionTime = new Date();
+                reconnectAttempts = 0;
+                logSuccess('WhatsApp Sender Berhasil Terhubung!');
+                if (sock.user && sock.user.id) {
+                    log('Logged in as:', sock.user.id);
                 }
-                const delayMs = Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 60000);
-                logger.warn(`⏳ Mencoba reconnect dalam ${delayMs / 1000} detik... (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-                setTimeout(() => startWhatsApp(), delayMs);
-            } else {
-                logger.error('🚫 Akun keluar/blockir. Hapus folder auth_info_baileys dan coba lagi.');
+            } else if (connection === 'close') {
+                connectionState = 'disconnected';
+                const statusCode = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
+                logError('Koneksi WA terputus. Status Code:', statusCode || 'Tidak diketahui');
+
+                if (statusCode !== 410 && statusCode !== 401) {
+                    reconnectAttempts++;
+                    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+                        logError('Max reconnect attempts (' + MAX_RECONNECT_ATTEMPTS + ') tercapai. Manual restart diperlukan.');
+                        return;
+                    }
+                    const delayMs = Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 60000);
+                    logWarn('Mencoba reconnect dalam', (delayMs / 1000), 'detik... (attempt ' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')');
+                    setTimeout(function () {
+                        startWhatsApp();
+                    }, delayMs);
+                } else {
+                    logError('Akun keluar/blockir (401/410). Hapus folder auth_info_baileys dan coba lagi.');
+                }
+            }
+        });
+
+        // Pairing code
+        if (!state.creds.registered && config.WA_NUMBER) {
+            const phoneNumber = config.WA_NUMBER.replace(/\D/g, '');
+            log('Nomor di config:', config.WA_NUMBER);
+            log('Nomor setelah clean:', phoneNumber);
+            log('Panjang nomor:', phoneNumber.length, 'digit');
+
+            if (phoneNumber.length < 8 || phoneNumber.length > 15) {
+                logError('Format nomor tidak valid! Harus 8-15 digit tanpa + atau spasi.');
+                logError('Contoh benar: 6281234567890');
+                return;
+            }
+
+            await delay(3000);
+            try {
+                const code = await sock.requestPairingCode(phoneNumber);
+                log('');
+                log('========================================');
+                log('🔑 KODE PAIRING ANDA:', code);
+                log('========================================');
+                log('Cara pakai:');
+                log('1. Buka WhatsApp di HP');
+                log('2. Settings > Linked Devices > Link a Device');
+                log('3. Tap "Link with phone number instead"');
+                log('4. Pilih negara + masukkan nomor (tanpa +62)');
+                log('5. Masukkan kode di atas (60 detik!)');
+                log('========================================');
+                log('');
+            } catch (err) {
+                logError('Gagal meminta kode pairing:', err.message);
+                logToFile('Pairing error: ' + err.message);
             }
         }
-    });
-
-    // Pairing code jika belum registered
-    if (!state.creds.registered && config.WA_NUMBER) {
-        const phoneNumber = config.WA_NUMBER.replace(/\D/g, '');
-        await delay(3000);
-        try {
-            const code = await sock.requestPairingCode(phoneNumber);
-            logger.info('\n========================================');
-            logger.info(`🔑 KODE PAIRING ANDA: ${code}`);
-            logger.info('========================================');
-        } catch (err) {
-            logger.error('❌ Gagal meminta kode pairing.', err);
-        }
+    } catch (err) {
+        connectionState = 'disconnected';
+        logError('Error startWhatsApp:', err.message);
+        logToFile('startWhatsApp error: ' + err.stack);
+        // Retry after 10s
+        setTimeout(function () {
+            startWhatsApp();
+        }, 10000);
     }
 }
 
 // ============ EXPRESS APP ============
 const app = express();
 
-// Middleware
-app.use(cors());
+// CORS MANUAL (tanpa dependency cors)
+app.use(function (req, res, next) {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-key');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ============ HEALTH CHECK ============
-app.get('/health', (req, res) => {
+app.get('/health', function (req, res) {
     res.json({
         status: 'ok',
         uptime: Math.floor((Date.now() - metrics.startTime) / 1000),
@@ -232,125 +336,142 @@ app.get('/health', (req, res) => {
     });
 });
 
-// ============ WHATSAPP STATUS ============
-app.get('/status', (req, res) => {
+// ============ STATUS ============
+app.get('/status', function (req, res) {
     res.json({
         connected: connectionState === 'connected',
         state: connectionState,
-        user: sock?.user?.id || null,
+        user: (sock && sock.user) ? sock.user.id : null,
         lastConnection: lastConnectionTime,
-        reconnectAttempts
+        reconnectAttempts: reconnectAttempts
     });
 });
 
 // ============ METRICS ============
-app.get('/metrics', (req, res) => {
+app.get('/metrics', function (req, res) {
     const uptime = Math.floor((Date.now() - metrics.startTime) / 1000);
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    const seconds = uptime % 60;
     res.json({
-        ...metrics,
+        totalRequests: metrics.totalRequests,
+        totalSingleChecks: metrics.totalSingleChecks,
+        totalMassChecks: metrics.totalMassChecks,
+        totalCooldownChecks: metrics.totalCooldownChecks,
+        totalSuccess: metrics.totalSuccess,
+        totalErrors: metrics.totalErrors,
+        startTime: new Date(metrics.startTime).toISOString(),
+        lastError: metrics.lastError,
+        lastErrorTime: metrics.lastErrorTime,
         uptimeSeconds: uptime,
-        uptimeFormatted: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`,
+        uptimeFormatted: hours + 'h ' + minutes + 'm ' + seconds + 's',
         cacheSize: bioCache.size()
     });
 });
 
 // ============ CEK 1 NOMOR (BIO) ============
-app.get('/cek', apiLimiter, async (req, res) => {
+app.get('/cek', apiLimiter, async function (req, res) {
     const nomor = req.query.nomor;
     metrics.totalRequests++;
     metrics.totalSingleChecks++;
-    
+
     if (!nomor) {
-        return res.status(400).json({ status: false, bio: "Nomor tidak ada" });
+        return res.status(400).json({ status: false, bio: 'Nomor tidak ada' });
     }
-    
+
     const jid = toJid(nomor);
     if (!jid) {
-        return res.status(400).json({ status: false, bio: "Format nomor tidak valid" });
+        return res.status(400).json({ status: false, bio: 'Format nomor tidak valid' });
     }
-    
+
     try {
         if (!sock || !sock.user || connectionState !== 'connected') {
-            return res.status(503).json({ status: false, bio: "Sender WA offline!" });
+            return res.status(503).json({ status: false, bio: 'Sender WA offline!' });
         }
-        
+
         // Cek cache dulu
-        const cached = bioCache.get(`bio_${jid}`);
+        const cached = bioCache.get('bio_' + jid);
         if (cached) {
-            logger.info(`📦 Cache hit untuk ${jid}`);
-            return res.json({ status: true, bio: cached.bio, exists: cached.exists, cached: true });
+            log('Cache hit untuk', jid);
+            return res.json({
+                status: true,
+                bio: cached.bio,
+                exists: cached.exists,
+                cached: true
+            });
         }
-        
-        const result = await withRetry(async () => {
+
+        const result = await withRetry(async function () {
             const [exists] = await sock.onWhatsApp(jid);
             if (!exists || !exists.exists) {
                 return { exists: false, bio: null };
             }
             const status = await sock.fetchStatus(jid);
-            return { 
-                exists: true, 
-                bio: status?.status || "Bio tidak tersedia" 
+            return {
+                exists: true,
+                bio: (status && status.status) ? status.status : 'Bio tidak tersedia'
             };
         });
-        
+
         metrics.totalSuccess++;
-        
-        // Simpan ke cache
-        bioCache.set(`bio_${jid}`, result);
-        
-        res.json({ 
-            status: true, 
-            bio: result.bio || "Bio tidak tersedia",
+
+        bioCache.set('bio_' + jid, result);
+
+        res.json({
+            status: true,
+            bio: result.bio || 'Bio tidak tersedia',
             exists: result.exists
         });
     } catch (err) {
         metrics.totalErrors++;
         metrics.lastError = err.message;
         metrics.lastErrorTime = new Date().toISOString();
-        logger.error(`❌ Error cek ${nomor}:`, err.message);
-        res.json({ status: false, bio: "Nomor tidak terdaftar di WA / Private" });
+        logError('Error cek', nomor, ':', err.message);
+        logToFile('ERROR /cek ' + nomor + ': ' + err.message);
+        res.json({ status: false, bio: 'Nomor tidak terdaftar di WA / Private' });
     }
 });
 
 // ============ CEK DETAIL LENGKAP ============
-app.get('/detail', apiLimiter, async (req, res) => {
+app.get('/detail', apiLimiter, async function (req, res) {
     const nomor = req.query.nomor;
     metrics.totalRequests++;
-    
+
     if (!nomor) {
-        return res.status(400).json({ status: false, error: "Nomor tidak ada" });
+        return res.status(400).json({ status: false, error: 'Nomor tidak ada' });
     }
-    
+
     const jid = toJid(nomor);
     if (!jid) {
-        return res.status(400).json({ status: false, error: "Format nomor tidak valid" });
+        return res.status(400).json({ status: false, error: 'Format nomor tidak valid' });
     }
-    
+
     try {
         if (!sock || !sock.user || connectionState !== 'connected') {
-            return res.status(503).json({ status: false, error: "Sender WA offline!" });
+            return res.status(503).json({ status: false, error: 'Sender WA offline!' });
         }
-        
-        const result = await withRetry(async () => {
+
+        const result = await withRetry(async function () {
             const [exists] = await sock.onWhatsApp(jid);
             if (!exists || !exists.exists) {
                 return { exists: false };
             }
-            
+
             const detail = {
                 exists: true,
                 jid: jid,
                 bio: null,
                 business: null,
-                name: null,
-                isBusiness: false
+                isBusiness: false,
+                hasPhoto: false,
+                photo: null
             };
-            
+
             try {
                 const status = await sock.fetchStatus(jid);
-                detail.bio = status?.status || null;
+                detail.bio = (status && status.status) ? status.status : null;
             } catch (e) {}
-            
+
             try {
                 const biz = await sock.getBusinessProfile(jid);
                 if (biz) {
@@ -360,108 +481,105 @@ app.get('/detail', apiLimiter, async (req, res) => {
                         description: biz.description || null,
                         email: biz.email || null,
                         website: biz.website || null,
-                        category: biz.categories?.[0]?.name || null,
                         address: biz.address || null
                     };
                 }
             } catch (e) {}
-            
+
             try {
-                const profile = await sock.profilePictureUrl(jid, 'preview').catch(() => null);
-                detail.hasPhoto = !!profile;
-                detail.photo = profile;
-            } catch (e) { detail.hasPhoto = false; }
-            
+                const photo = await sock.profilePictureUrl(jid, 'preview');
+                detail.hasPhoto = !!photo;
+                detail.photo = photo;
+            } catch (e) {
+                detail.hasPhoto = false;
+            }
+
             return detail;
         });
-        
+
         metrics.totalSuccess++;
         res.json({ status: true, data: result });
     } catch (err) {
         metrics.totalErrors++;
         metrics.lastError = err.message;
         metrics.lastErrorTime = new Date().toISOString();
-        logger.error(`❌ Error detail ${nomor}:`, err.message);
+        logError('Error detail', nomor, ':', err.message);
+        logToFile('ERROR /detail ' + nomor + ': ' + err.message);
         res.json({ status: false, error: err.message });
     }
 });
 
 // ============ CEK COOLDOWN OTP ============
-app.get('/cooldown', apiLimiter, async (req, res) => {
+app.get('/cooldown', apiLimiter, async function (req, res) {
     const nomor = req.query.nomor;
     metrics.totalRequests++;
     metrics.totalCooldownChecks++;
-    
+
     if (!nomor) {
-        return res.status(400).json({ status: false, error: "Nomor tidak ada" });
+        return res.status(400).json({ status: false, error: 'Nomor tidak ada' });
     }
-    
+
     const jid = toJid(nomor);
     if (!jid) {
-        return res.status(400).json({ status: false, error: "Format nomor tidak valid" });
+        return res.status(400).json({ status: false, error: 'Format nomor tidak valid' });
     }
-    
+
     try {
         if (!sock || !sock.user || connectionState !== 'connected') {
-            return res.status(503).json({ status: false, error: "Sender WA offline!" });
+            return res.status(503).json({ status: false, error: 'Sender WA offline!' });
         }
-        
-        // Cek cooldown cache (status 10 menit TTL)
-        const cachedCooldown = cooldownCache.get(`cooldown_${jid}`);
+
+        const cachedCooldown = cooldownCache.get('cooldown_' + jid);
         const now = Date.now();
         const cooldownDuration = 5 * 60 * 1000; // 5 menit
-        
+
         let status, isOnCooldown, cooldownEnds;
-        
+
         if (cachedCooldown && (now - cachedCooldown.lastCheck < 60000)) {
             // Cache masih fresh (< 1 menit)
             status = cachedCooldown.status;
             isOnCooldown = cachedCooldown.isOnCooldown;
             cooldownEnds = cachedCooldown.cooldownEnds;
         } else {
-            // Cek apakah nomor terdaftar
+            // Cek ke WhatsApp
             const [exists] = await sock.onWhatsApp(jid);
-            
+
             if (!exists || !exists.exists) {
-                return res.json({ 
-                    status: false, 
-                    error: "Nomor tidak terdaftar di WA",
+                return res.json({
+                    status: false,
+                    error: 'Nomor tidak terdaftar di WA',
                     phone: sanitizeNumber(nomor),
                     timestamp: new Date().toISOString()
                 });
             }
-            
-            // Logika cooldown sederhana: 
-            // Jika baru saja dicek (< 5 menit) → cooldown
-            // Jika sudah lama tidak dicek → ready
+
             if (cachedCooldown) {
                 const timeSinceLastCheck = now - cachedCooldown.lastCheck;
                 if (timeSinceLastCheck < cooldownDuration) {
-                    status = "cooldown";
+                    status = 'cooldown';
                     isOnCooldown = true;
                     cooldownEnds = cachedCooldown.lastCheck + cooldownDuration;
                 } else {
-                    status = "ready";
+                    status = 'ready';
                     isOnCooldown = false;
                     cooldownEnds = null;
                 }
             } else {
-                status = "ready";
+                status = 'ready';
                 isOnCooldown = false;
                 cooldownEnds = null;
             }
-            
-            // Simpan ke cache
-            cooldownCache.set(`cooldown_${jid}`, {
-                status,
-                isOnCooldown,
-                cooldownEnds,
+
+            cooldownCache.set('cooldown_' + jid, {
+                status: status,
+                isOnCooldown: isOnCooldown,
+                cooldownEnds: cooldownEnds,
                 lastCheck: now
             });
         }
-        
+
         metrics.totalSuccess++;
-        
+
         res.json({
             status: true,
             phone: sanitizeNumber(nomor),
@@ -470,15 +588,16 @@ app.get('/cooldown', apiLimiter, async (req, res) => {
             isOnCooldown: isOnCooldown,
             cooldownEnds: cooldownEnds ? new Date(cooldownEnds).toISOString() : null,
             timestamp: new Date().toISOString(),
-            message: isOnCooldown ? "Nomor sedang cooldown" : "Nomor siap OTP"
+            message: isOnCooldown ? 'Nomor sedang cooldown' : 'Nomor siap OTP'
         });
     } catch (err) {
         metrics.totalErrors++;
         metrics.lastError = err.message;
         metrics.lastErrorTime = new Date().toISOString();
-        logger.error(`❌ Error cooldown ${nomor}:`, err.message);
-        res.json({ 
-            status: false, 
+        logError('Error cooldown', nomor, ':', err.message);
+        logToFile('ERROR /cooldown ' + nomor + ': ' + err.message);
+        res.json({
+            status: false,
             error: err.message,
             timestamp: new Date().toISOString()
         });
@@ -486,26 +605,26 @@ app.get('/cooldown', apiLimiter, async (req, res) => {
 });
 
 // ============ CEK MASSAL ============
-app.post('/masscek', massLimiter, async (req, res) => {
-    const numbers = req.body?.numbers;
+app.post('/masscek', massLimiter, async function (req, res) {
+    const numbers = req.body && req.body.numbers;
     metrics.totalRequests++;
     metrics.totalMassChecks++;
-    
+
     if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
-        return res.status(400).json({ status: false, error: "Format salah: numbers harus array" });
+        return res.status(400).json({ status: false, error: 'Format salah: numbers harus array' });
     }
-    
+
     if (numbers.length > 1000) {
-        return res.status(400).json({ 
-            status: false, 
-            error: "Maksimal 1000 nomor per request" 
+        return res.status(400).json({
+            status: false,
+            error: 'Maksimal 1000 nomor per request'
         });
     }
-    
+
     if (!sock || !sock.user || connectionState !== 'connected') {
-        return res.status(503).json({ status: false, error: "Sender WA offline!" });
+        return res.status(503).json({ status: false, error: 'Sender WA offline!' });
     }
-    
+
     const stats = {
         total: numbers.length,
         registered: 0,
@@ -513,32 +632,31 @@ app.post('/masscek', massLimiter, async (req, res) => {
         hasBio: 0,
         noBio: 0,
         business: 0,
-        errors: 0,
-        byYear: {}
+        errors: 0
     };
-    
+
     const results = [];
-    logger.info(`📥 Menerima request massal cek ${numbers.length} nomor...`);
+    log('Menerima request massal cek', numbers.length, 'nomor...');
     const startTime = Date.now();
-    
+
     for (let i = 0; i < numbers.length; i++) {
         const num = numbers[i];
         const jid = toJid(num);
-        
+
         if (!jid) {
             stats.notRegistered++;
             stats.errors++;
             results.push({
                 number: num,
                 exists: false,
-                error: "Format nomor tidak valid"
+                error: 'Format nomor tidak valid'
             });
             continue;
         }
-        
+
         try {
             const [result] = await sock.onWhatsApp(jid);
-            
+
             if (result && result.exists) {
                 stats.registered++;
                 const numResult = {
@@ -549,11 +667,11 @@ app.post('/masscek', massLimiter, async (req, res) => {
                     isBusiness: false,
                     business: null
                 };
-                
+
                 // Cek Bio
                 try {
                     const status = await sock.fetchStatus(jid);
-                    if (status?.status && status.status.trim() !== "") {
+                    if (status && status.status && status.status.trim() !== '') {
                         stats.hasBio++;
                         numResult.bio = status.status;
                     } else {
@@ -562,7 +680,7 @@ app.post('/masscek', massLimiter, async (req, res) => {
                 } catch (e) {
                     stats.noBio++;
                 }
-                
+
                 // Cek Business
                 try {
                     const biz = await sock.getBusinessProfile(jid);
@@ -575,14 +693,11 @@ app.post('/masscek', massLimiter, async (req, res) => {
                         };
                     }
                 } catch (e) {}
-                
+
                 results.push(numResult);
             } else {
                 stats.notRegistered++;
-                results.push({
-                    number: num,
-                    exists: false
-                });
+                results.push({ number: num, exists: false });
             }
         } catch (err) {
             stats.notRegistered++;
@@ -592,118 +707,126 @@ app.post('/masscek', massLimiter, async (req, res) => {
                 exists: false,
                 error: err.message
             });
-            logger.error(`❌ Error cek ${num}: ${err.message}`);
+            logError('Error cek', num, ':', err.message);
         }
-        
-        // Progress logging setiap 50 nomor
+
+        // Progress setiap 50 nomor
         if ((i + 1) % 50 === 0) {
-            logger.info(`📊 Progress: ${i + 1}/${numbers.length} (${Math.floor((i + 1) / numbers.length * 100)}%)`);
+            log('Progress:', (i + 1) + '/' + numbers.length, '(' + Math.floor((i + 1) / numbers.length * 100) + '%)');
         }
-        
-        await delay(300); // Jeda 300ms agar tidak banned
+
+        await delay(300); // 300ms jeda anti-ban
     }
-    
+
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    logger.info(`✅ Selesai cek massal ${numbers.length} nomor dalam ${duration} detik.`);
-    
-    res.json({ 
-        status: true, 
+    logSuccess('Selesai cek massal', numbers.length, 'nomor dalam', duration, 'detik.');
+
+    res.json({
+        status: true,
         stats: stats,
         results: results,
-        duration: `${duration}s`,
+        duration: duration + 's',
         timestamp: new Date().toISOString()
     });
 });
 
 // ============ CLEAR CACHE ============
-app.post('/clearcache', (req, res) => {
+app.post('/clearcache', function (req, res) {
     bioCache.clear();
     cooldownCache.clear();
-    logger.info('🧹 Cache dibersihkan');
+    log('Cache dibersihkan');
     res.json({ status: true, message: 'Cache cleared' });
 });
 
 // ============ RESTART (ADMIN) ============
-app.post('/restart', async (req, res) => {
+app.post('/restart', function (req, res) {
     const adminKey = req.headers['x-admin-key'];
-    if (adminKey !== config.ADMIN_KEY) {
+    if (!config.ADMIN_KEY || adminKey !== config.ADMIN_KEY) {
         return res.status(403).json({ status: false, error: 'Unauthorized' });
     }
-    logger.warn('🔄 Restart diminta oleh admin...');
+    logWarn('Restart diminta oleh admin...');
     res.json({ status: true, message: 'Restarting...' });
-    setTimeout(() => {
+    setTimeout(function () {
         process.exit(0);
     }, 1000);
 });
 
-// ============ ERROR HANDLER MIDDLEWARE ============
-app.use((err, req, res, next) => {
+// ============ ERROR HANDLER ============
+app.use(function (err, req, res, next) {
     metrics.totalErrors++;
-    logger.error('💥 Unhandled error:', err);
-    res.status(500).json({ 
-        status: false, 
+    logError('Unhandled error:', err.message);
+    logToFile('UNHANDLED ERROR: ' + (err.stack || err.message));
+    res.status(500).json({
+        status: false,
         error: 'Internal server error',
-        message: process.env.NODE_ENV === 'development' ? err.message : undefined
+        message: err.message
     });
 });
 
-// ============ 404 HANDLER ============
-app.use((req, res) => {
-    res.status(404).json({ 
-        status: false, 
+// ============ 404 ============
+app.use(function (req, res) {
+    res.status(404).json({
+        status: false,
         error: 'Endpoint tidak ditemukan',
-        available: ['/health', '/status', '/metrics', '/cek', '/detail', '/cooldown', '/masscek', '/clearcache']
+        available: ['/health', '/status', '/metrics', '/cek', '/detail', '/cooldown', '/masscek', '/clearcache', '/restart']
     });
 });
 
 // ============ GRACEFUL SHUTDOWN ============
-process.on('SIGINT', async () => {
-    logger.info('\n🛑 SIGINT received. Shutting down gracefully...');
+process.on('SIGINT', async function () {
+    log('\nSIGINT received. Shutting down gracefully...');
     if (sock) {
         try {
             await sock.logout();
-            logger.info('✅ WhatsApp logged out');
+            logSuccess('WhatsApp logged out');
         } catch (e) {
-            logger.error('Error logout:', e.message);
+            logError('Error logout:', e.message);
         }
     }
     process.exit(0);
 });
 
-process.on('SIGTERM', async () => {
-    logger.info('\n🛑 SIGTERM received. Shutting down...');
+process.on('SIGTERM', async function () {
+    log('SIGTERM received. Shutting down...');
     if (sock) {
-        try {
-            await sock.logout();
-        } catch (e) {}
+        try { await sock.logout(); } catch (e) {}
     }
     process.exit(0);
 });
 
-process.on('uncaughtException', (err) => {
-    logger.error('💥 Uncaught Exception:', err);
+process.on('uncaughtException', function (err) {
+    logError('Uncaught Exception:', err.message);
+    logToFile('UNCAUGHT EXCEPTION: ' + (err.stack || err.message));
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    logger.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+process.on('unhandledRejection', function (reason, promise) {
+    logError('Unhandled Rejection:', reason);
+    logToFile('UNHANDLED REJECTION: ' + reason);
 });
 
 // ============ START SERVER ============
 const PORT = config.PORT || 3000;
 
-app.listen(PORT, () => {
-    logger.info('========================================');
-    logger.info(`🟢 API Sender jalan di port ${PORT}`);
-    logger.info(`📊 Health: http://localhost:${PORT}/health`);
-    logger.info(`📈 Metrics: http://localhost:${PORT}/metrics`);
-    logger.info('========================================');
+const server = app.listen(PORT, function () {
+    log('========================================');
+    log('🟢 API Sender jalan di port', PORT);
+    log('📊 Health:  http://localhost:' + PORT + '/health');
+    log('📈 Metrics: http://localhost:' + PORT + '/metrics');
+    log('========================================');
+});
+
+server.on('error', function (err) {
+    if (err.code === 'EADDRINUSE') {
+        logError('Port', PORT, 'sudah dipakai! Ganti PORT di config.json.');
+    } else {
+        logError('Server error:', err.message);
+    }
 });
 
 // Start WhatsApp connection
 startWhatsApp();
 
-// ============ CLEANUP INTERVAL (tiap 1 jam) ============
-setInterval(() => {
-    logger.info(`🧹 Auto cleanup | Cache: ${bioCache.size()} bio, ${cooldownCache.size()} cooldown`);
-    // TTLCache auto-clean saat get(), tapi kita tetap log
+// Cleanup info tiap 1 jam
+setInterval(function () {
+    log('Status:', connectionState, '| Cache:', bioCache.size(), 'bio,', cooldownCache.size(), 'cooldown');
 }, 60 * 60 * 1000);
